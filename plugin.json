@@ -1,0 +1,17 @@
+{
+  "name": "thought-translator",
+  "displayName": "Thought Translator",
+  "version": "0.2.0",
+  "author": {
+    "name": "AyakaNya",
+    "url": "https://github.com/AyakaNya"
+  },
+  "repository": "https://github.com/AyakaNya/agy-thought-translator",
+  "description": "Automatically translates model thinking blocks in-place inside Antigravity chat windows via headless CDP injection, with multi-provider streaming and local disk caching.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Check whether the Thought Translator background sidecar is running",
+    "Configure Gemini, OpenAI-compatible, or DeepL API settings for Thought Translator",
+    "Inspect Thought Translator cached translations"
+  ]
+}

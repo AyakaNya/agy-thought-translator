@@ -1,0 +1,8 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Thought Translator",
+  "description": "Background CDP injector and multi-provider translation engine that translates model thinking blocks in-place.",
+  "has_web_ui": false
+}
