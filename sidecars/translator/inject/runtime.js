@@ -188,6 +188,17 @@
     .tt-ui .tt-content p:last-child {
       margin-bottom: 0;
     }
+    .tt-ui .tt-seg-item {
+      margin-bottom: 8px;
+    }
+    .tt-ui .tt-seg-item:last-child {
+      margin-bottom: 0;
+    }
+    .tt-ui .tt-seg-pending {
+      opacity: 0.6;
+      font-style: italic;
+      font-size: 0.92em;
+    }
     .tt-ui .tt-content ul, .tt-ui .tt-content ol {
       margin: 4px 0 6px;
       padding-left: 18px;
@@ -417,13 +428,74 @@
       if (node.nodeType !== Node.ELEMENT_NODE) return;
       const tag = node.tagName;
       if (tag === 'STYLE' || tag === 'SCRIPT' || node.classList.contains('tt-ui')) return;
-      const isBlock = /^(P|DIV|LI|PRE|BLOCKQUOTE|H[1-6]|BR)$/.test(tag);
       if (tag === 'BR') { chunks.push('\n'); return; }
+      const isParaBlock = /^(P|PRE|BLOCKQUOTE|H[1-6])$/.test(tag);
+      const isLineBlock = /^(DIV|LI)$/.test(tag);
       for (const c of node.childNodes) walk(c);
-      if (isBlock) chunks.push('\n');
+      if (isParaBlock) chunks.push('\n\n');
+      else if (isLineBlock) chunks.push('\n');
     };
     walk(el);
-    return chunks.join('').replace(/[ \t]+\n/g, '\n').trim();
+    return chunks.join('').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  // Split text into logical paragraphs while keeping fenced code blocks intact
+  function splitParagraphs(text) {
+    const src = String(text ?? '').trim();
+    if (!src) return [];
+    const lines = src.split('\n');
+    const paras = [];
+    let buf = [];
+    let inFence = false;
+
+    const flush = () => {
+      const joined = buf.join('\n').trim();
+      if (joined) paras.push(joined);
+      buf = [];
+    };
+
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) {
+        inFence = !inFence;
+        buf.push(line);
+        continue;
+      }
+      if (!inFence && line.trim() === '') {
+        flush();
+      } else {
+        buf.push(line);
+      }
+    }
+    flush();
+    return paras;
+  }
+
+  function findScrollContainer(el) {
+    let cur = el;
+    while (cur && cur !== document.body) {
+      const style = getComputedStyle(cur);
+      if (/(auto|scroll)/.test(style.overflowY) && cur.scrollHeight > cur.clientHeight + 2) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return el;
+  }
+
+  function withScrollPreserved(contentEl, fn) {
+    const scroller = findScrollContainer(contentEl);
+    const prevTop = scroller ? scroller.scrollTop : 0;
+    const atBottom = scroller
+      ? (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 36)
+      : false;
+    fn();
+    if (scroller) {
+      if (atBottom) {
+        scroller.scrollTop = scroller.scrollHeight;
+      } else {
+        scroller.scrollTop = prevTop;
+      }
+    }
   }
 
   // Track state per expanded thinking content element
@@ -435,11 +507,11 @@
     if (!st) {
       st = {
         mode: config.defaultDisplayMode || 'translation', // 'translation' | 'bilingual' | 'original'
-        status: 'idle', // 'idle' | 'streaming' | 'translated' | 'skipped' | 'error'
-        lastText: '',
-        translation: '',
-        error: '',
-        debounceTimer: null,
+        isDone: false,
+        segments: [], // [{ orig, translatedOrig, translation, status, error, domEl, dirtyRender }]
+        running: false,
+        pendingRescan: false,
+        tailTimer: null,
         boxEl: null,
       };
       cardStates.set(contentEl, st);
@@ -475,8 +547,8 @@
         e.stopPropagation();
         st.mode = modeBtn.dataset.mode;
         renderCard(contentEl, st);
-        if (st.mode !== 'original' && st.status === 'idle') {
-          triggerTranslate(contentEl, st, false);
+        if (st.mode !== 'original') {
+          drainSegments(contentEl, st, false);
         }
         return;
       }
@@ -484,7 +556,14 @@
       if (actBtn) {
         e.stopPropagation();
         if (actBtn.dataset.act === 'retranslate') {
-          triggerTranslate(contentEl, st, true);
+          // Mark all segments dirty for forced re-translation without clearing visible text
+          for (const seg of st.segments) {
+            seg.translatedOrig = '';
+            seg.status = 'pending';
+            seg.error = '';
+            seg.forceOnce = true;
+          }
+          drainSegments(contentEl, st, true);
         } else if (actBtn.dataset.act === 'settings') {
           openSettingsModal();
         }
@@ -496,92 +575,223 @@
     return box;
   }
 
+  function computeOverallStatus(st) {
+    if (!st.segments.length) return 'idle';
+    if (st.segments.some((s) => s.status === 'streaming')) return 'streaming';
+    if (st.segments.some((s) => s.status === 'error')) return 'error';
+    if (st.segments.every((s) => s.status === 'skipped')) return 'skipped';
+    if (st.segments.some((s) => s.status === 'translated')) {
+      if (st.segments.some((s) => s.status === 'pending' || s.translatedOrig !== s.orig)) {
+        return st.running ? 'streaming' : 'translated';
+      }
+      return 'translated';
+    }
+    return 'idle';
+  }
+
   function renderCard(contentEl, st) {
-    const box = ensureBox(contentEl, st);
-    const dot = box.querySelector('.tt-dot');
-    const statusText = box.querySelector('.tt-status-text');
-    const contentDiv = box.querySelector('.tt-content');
-    const errDiv = box.querySelector('.tt-err-msg');
+    withScrollPreserved(contentEl, () => {
+      const box = ensureBox(contentEl, st);
+      const dot = box.querySelector('.tt-dot');
+      const statusText = box.querySelector('.tt-status-text');
+      const contentDiv = box.querySelector('.tt-content');
+      const errDiv = box.querySelector('.tt-err-msg');
 
-    for (const b of box.querySelectorAll('button[data-mode]')) {
-      b.classList.toggle('active', b.dataset.mode === st.mode);
+      for (const b of box.querySelectorAll('button[data-mode]')) {
+        b.classList.toggle('active', b.dataset.mode === st.mode);
+      }
+
+      const overall = computeOverallStatus(st);
+      const hasAnyTranslated = st.segments.some((s) => s.translation || s.status === 'streaming');
+      const hideOrig = st.mode === 'translation' && overall !== 'skipped' && overall !== 'idle' && hasAnyTranslated;
+      contentEl.classList.toggle('tt-hide-orig', hideOrig);
+      box.classList.toggle('tt-bilingual', st.mode === 'bilingual' && hasAnyTranslated);
+
+      dot.className = 'tt-dot';
+      if (overall === 'streaming') {
+        dot.classList.add('streaming');
+        statusText.textContent = '翻譯中…';
+      } else if (overall === 'translated') {
+        statusText.textContent = st.isDone ? '已翻譯' : '同步翻譯中…';
+      } else if (overall === 'skipped') {
+        statusText.textContent = '已是目標語言';
+      } else if (overall === 'error') {
+        dot.classList.add('err');
+        statusText.textContent = '翻譯失敗';
+      } else if (!config.ready) {
+        dot.classList.add('warn');
+        statusText.textContent = '未設定 API Key';
+      } else {
+        dot.classList.add('warn');
+        statusText.textContent = '等待翻譯';
+      }
+
+      if (st.mode === 'original' || overall === 'skipped' || (!hasAnyTranslated && overall === 'idle')) {
+        contentDiv.style.display = 'none';
+      } else {
+        contentDiv.style.display = '';
+        // Sync per-segment DOM nodes incrementally so already-translated paragraphs never flicker
+        while (contentDiv.children.length > st.segments.length) {
+          contentDiv.lastElementChild.remove();
+        }
+        st.segments.forEach((seg, idx) => {
+          let el = seg.domEl;
+          if (!el || el.parentElement !== contentDiv) {
+            el = contentDiv.children[idx] || document.createElement('div');
+            el.className = 'tt-seg-item';
+            if (!el.parentElement) contentDiv.appendChild(el);
+            seg.domEl = el;
+            seg.dirtyRender = true;
+          }
+          if (!seg.dirtyRender) return;
+          seg.dirtyRender = false;
+
+          if (seg.status === 'translated') {
+            el.innerHTML = renderMarkdown(seg.translation);
+          } else if (seg.status === 'skipped') {
+            el.innerHTML = renderMarkdown(seg.orig);
+          } else if (seg.status === 'streaming') {
+            const partial = seg.streamingText || seg.translation;
+            if (partial) {
+              el.innerHTML = `${renderMarkdown(partial)}<span class="tt-cursor"></span>`;
+            } else {
+              el.innerHTML = `<span class="tt-seg-pending">正在翻譯此段…</span><span class="tt-cursor"></span>`;
+            }
+          } else if (seg.translation) {
+            // Keep existing translation visible while waiting for tail update
+            el.innerHTML = renderMarkdown(seg.translation);
+          } else {
+            el.innerHTML = '';
+          }
+        });
+      }
+
+      const firstErr = st.segments.find((s) => s.status === 'error' && s.error);
+      if (firstErr) {
+        errDiv.style.display = '';
+        errDiv.textContent = firstErr.error;
+      } else {
+        errDiv.style.display = 'none';
+        errDiv.textContent = '';
+      }
+    });
+  }
+
+  function syncSegments(st, paragraphs) {
+    // Update existing segments in-place without clearing already-translated text
+    for (let i = 0; i < paragraphs.length; i++) {
+      const p = paragraphs[i];
+      if (i < st.segments.length) {
+        const seg = st.segments[i];
+        if (seg.orig !== p) {
+          seg.orig = p;
+          // Only mark pending if not currently streaming; keep seg.translation intact!
+          if (seg.status !== 'streaming') {
+            seg.status = 'pending';
+          }
+        }
+      } else {
+        st.segments.push({
+          orig: p,
+          translatedOrig: '',
+          translation: '',
+          streamingText: '',
+          status: 'pending',
+          error: '',
+          forceOnce: false,
+          domEl: null,
+          dirtyRender: true,
+        });
+      }
     }
-
-    const hasTranslationContent = (st.status === 'translated' || st.status === 'streaming') && Boolean(st.translation);
-    const hideOrig = st.mode === 'translation' && (st.status === 'translated' || st.status === 'streaming');
-    contentEl.classList.toggle('tt-hide-orig', hideOrig);
-    box.classList.toggle('tt-bilingual', st.mode === 'bilingual' && hasTranslationContent);
-
-    dot.className = 'tt-dot';
-    if (st.status === 'streaming') {
-      dot.classList.add('streaming');
-      statusText.textContent = '翻譯中…';
-    } else if (st.status === 'translated') {
-      statusText.textContent = '已翻譯';
-    } else if (st.status === 'skipped') {
-      statusText.textContent = '已是目標語言';
-    } else if (st.status === 'error') {
-      dot.classList.add('err');
-      statusText.textContent = '翻譯失敗';
-    } else if (!config.ready) {
-      dot.classList.add('warn');
-      statusText.textContent = '未設定 API Key';
-    } else {
-      dot.classList.add('warn');
-      statusText.textContent = '未翻譯';
-    }
-
-    if (st.mode === 'original' || st.status === 'skipped' || st.status === 'idle') {
-      contentDiv.style.display = 'none';
-      contentDiv.innerHTML = '';
-    } else if (st.status === 'streaming') {
-      contentDiv.style.display = '';
-      const html = st.translation ? renderMarkdown(st.translation) : '<p><em>正在翻譯思考內容…</em></p>';
-      contentDiv.innerHTML = `${html}<span class="tt-cursor"></span>`;
-    } else if (st.status === 'translated') {
-      contentDiv.style.display = '';
-      contentDiv.innerHTML = renderMarkdown(st.translation);
-    } else {
-      contentDiv.style.display = 'none';
-      contentDiv.innerHTML = '';
-    }
-
-    if (st.status === 'error' && st.error) {
-      errDiv.style.display = '';
-      errDiv.textContent = st.error;
-    } else {
-      errDiv.style.display = 'none';
-      errDiv.textContent = '';
+    if (st.segments.length > paragraphs.length) {
+      st.segments.length = paragraphs.length;
     }
   }
 
-  async function triggerTranslate(contentEl, st, force) {
-    const text = extractOriginalText(contentEl);
-    if (!text) return;
-    st.lastText = text;
-    st.status = 'streaming';
-    st.translation = '';
-    st.error = '';
-    renderCard(contentEl, st);
+  function pickNextSegmentIndex(st, includeTail) {
+    const lastIdx = st.segments.length - 1;
+    for (let i = 0; i <= lastIdx; i++) {
+      const seg = st.segments[i];
+      const needsWork = seg.forceOnce || seg.translatedOrig !== seg.orig;
+      if (!needsWork) continue;
+      if (seg.status === 'skipped' && seg.translatedOrig === seg.orig) continue;
+      // While thinking is still streaming, translate finalized earlier paragraphs immediately;
+      // only translate the growing tail paragraph when includeTail is true (after pause or done).
+      if (i === lastIdx && !st.isDone && !includeTail) continue;
+      return i;
+    }
+    return -1;
+  }
 
+  async function drainSegments(contentEl, st, includeTail) {
+    if (st.running) {
+      st.pendingRescan = true;
+      return;
+    }
+    if (!config.ready) {
+      renderCard(contentEl, st);
+      return;
+    }
+
+    st.running = true;
     try {
-      const res = await hostCall('translate', { text, force }, (partial) => {
-        st.translation = partial;
-        st.status = 'streaming';
+      while (document.contains(contentEl)) {
+        const idx = pickNextSegmentIndex(st, includeTail || st.isDone);
+        if (idx === -1) break;
+
+        const seg = st.segments[idx];
+        const targetText = seg.orig;
+        const force = Boolean(seg.forceOnce);
+        seg.forceOnce = false;
+        seg.status = 'streaming';
+        seg.streamingText = '';
+        seg.error = '';
+        seg.dirtyRender = true;
         renderCard(contentEl, st);
-      });
-      if (res.status === 'skipped') {
-        st.status = 'skipped';
-        st.translation = '';
-      } else {
-        st.status = 'translated';
-        st.translation = res.translation || '';
+
+        // Gather previous translated paragraph as optional terminology/tone context
+        let prevContext = '';
+        for (let k = idx - 1; k >= 0; k--) {
+          if (st.segments[k].translation) {
+            prevContext = st.segments[k].translation;
+            break;
+          }
+        }
+
+        try {
+          const res = await hostCall('translate', { text: targetText, context: prevContext, force }, (partial) => {
+            seg.streamingText = partial;
+            seg.status = 'streaming';
+            seg.dirtyRender = true;
+            renderCard(contentEl, st);
+          });
+          seg.translatedOrig = targetText;
+          seg.streamingText = '';
+          if (res.status === 'skipped') {
+            seg.status = 'skipped';
+            seg.translation = '';
+          } else {
+            seg.status = 'translated';
+            seg.translation = res.translation || '';
+          }
+          seg.dirtyRender = true;
+          renderCard(contentEl, st);
+        } catch (err) {
+          seg.streamingText = '';
+          seg.status = 'error';
+          seg.error = err.message || String(err);
+          seg.dirtyRender = true;
+          renderCard(contentEl, st);
+          break;
+        }
       }
-      renderCard(contentEl, st);
-    } catch (err) {
-      st.status = 'error';
-      st.error = err.message || String(err);
-      renderCard(contentEl, st);
+    } finally {
+      st.running = false;
+      if (st.pendingRescan && document.contains(contentEl)) {
+        st.pendingRescan = false;
+        drainSegments(contentEl, st, st.isDone);
+      }
     }
   }
 
@@ -592,30 +802,34 @@
 
     const btnText = (btn.textContent || '').trim();
     const isDone = THOUGHT_DONE_RE.test(btnText);
+    st.isDone = isDone;
 
     ensureBox(contentEl, st);
 
-    if (text === st.lastText && (st.status === 'translated' || st.status === 'skipped' || st.status === 'streaming')) {
-      renderCard(contentEl, st);
-      return;
-    }
-
-    if (!config.autoTranslate || !config.ready) {
-      st.lastText = text;
-      renderCard(contentEl, st);
-      return;
-    }
-
-    // Debounce: fast (250ms) once thinking finished, slower (1200ms) while still streaming thinking
-    clearTimeout(st.debounceTimer);
-    st.debounceTimer = setTimeout(() => {
-      if (!document.contains(contentEl)) return;
-      const latest = extractOriginalText(contentEl);
-      if (!latest || (latest === st.lastText && st.status === 'translated')) return;
-      triggerTranslate(contentEl, st, false);
-    }, isDone ? 250 : 1200);
-
+    const paragraphs = splitParagraphs(text);
+    syncSegments(st, paragraphs);
     renderCard(contentEl, st);
+
+    if (!config.autoTranslate || !config.ready || st.mode === 'original') {
+      return;
+    }
+
+    // 1. Finalized earlier paragraphs (0 .. n-2) start translating immediately without waiting!
+    if (paragraphs.length > 1 && pickNextSegmentIndex(st, false) !== -1) {
+      drainSegments(contentEl, st, false);
+    }
+
+    // 2. For the growing tail paragraph: translate quickly (250ms) once thinking finishes,
+    //    or after a calm pause (1600ms) while still thinking.
+    clearTimeout(st.tailTimer);
+    st.tailTimer = setTimeout(() => {
+      if (!document.contains(contentEl)) return;
+      const latestText = extractOriginalText(contentEl);
+      if (latestText) {
+        syncSegments(st, splitParagraphs(latestText));
+      }
+      drainSegments(contentEl, st, true);
+    }, isDone ? 250 : 1600);
   }
 
   function scanThinkingBlocks() {
@@ -888,7 +1102,7 @@
     for (const el of activeContentEls) {
       el.classList.remove('tt-hide-orig');
       const st = cardStates.get(el);
-      if (st) clearTimeout(st.debounceTimer);
+      if (st) clearTimeout(st.tailTimer);
       if (st?.boxEl) st.boxEl.remove();
     }
     activeContentEls.clear();

@@ -241,6 +241,7 @@ class CdpTargetSession {
 
       if (action === 'translate') {
         const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
+        const context = typeof payload?.context === 'string' ? payload.context : '';
         const force = Boolean(payload?.force);
         const cfg = loadConfig();
         const targetLang = cfg.targetLang;
@@ -277,6 +278,7 @@ class CdpTargetSession {
           const result = await translateStream({
             text,
             targetLang,
+            context,
             config: cfg,
             signal: ac.signal,
             onChunk: (_delta, full) => {

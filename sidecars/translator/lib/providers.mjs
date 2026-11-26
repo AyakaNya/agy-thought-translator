@@ -5,16 +5,24 @@ function targetLangPromptName(code) {
   return found ? found.promptName : code;
 }
 
-function buildSystemPrompt(targetLang) {
+function buildSystemPrompt(targetLang, context = '') {
   const langName = targetLangPromptName(targetLang);
-  return [
+  const lines = [
     `You are a concise, accurate technical translator. Translate the following AI model's internal reasoning/thinking text into ${langName}.`,
     'Rules:',
     '1. Output ONLY the translated text. Do not add preambles, explanations, quotes, or notes.',
     '2. Preserve code blocks, inline code, file paths, CLI commands, API/function/variable names, and technical identifiers verbatim.',
     '3. Keep paragraph structure, bullet points, and markdown formatting intact.',
     '4. Use natural, idiomatic phrasing suitable for a software engineer.',
-  ].join('\n');
+  ];
+  if (context && context.trim()) {
+    lines.push(
+      '',
+      'Previous translated context (for terminology and tone continuity ONLY — do NOT repeat or include it in your output):',
+      context.trim().slice(-240),
+    );
+  }
+  return lines.join('\n');
 }
 
 async function readSSELines(response, onDataLine) {
@@ -42,7 +50,7 @@ async function readSSELines(response, onDataLine) {
   }
 }
 
-async function translateGemini({ text, targetLang, config, signal, onChunk }) {
+async function translateGemini({ text, targetLang, context, config, signal, onChunk }) {
   const { key } = getEffectiveApiKey(config, 'gemini');
   if (!key) {
     throw new Error('Missing Gemini API key. Open Settings or set GEMINI_API_KEY.');
@@ -56,7 +64,7 @@ async function translateGemini({ text, targetLang, config, signal, onChunk }) {
     signal,
     body: JSON.stringify({
       systemInstruction: {
-        parts: [{ text: buildSystemPrompt(targetLang) }],
+        parts: [{ text: buildSystemPrompt(targetLang, context) }],
       },
       contents: [
         { role: 'user', parts: [{ text }] },
@@ -94,7 +102,7 @@ async function translateGemini({ text, targetLang, config, signal, onChunk }) {
   return { translation: full.trim(), provider: 'gemini', model };
 }
 
-async function translateOpenAI({ text, targetLang, config, signal, onChunk }) {
+async function translateOpenAI({ text, targetLang, context, config, signal, onChunk }) {
   const { key } = getEffectiveApiKey(config, 'openai');
   if (!key && !isLocalOpenAI(config)) {
     throw new Error('Missing OpenAI-compatible API key. Open Settings or set OPENAI_API_KEY.');
@@ -113,7 +121,7 @@ async function translateOpenAI({ text, targetLang, config, signal, onChunk }) {
       temperature: 0.2,
       stream: true,
       messages: [
-        { role: 'system', content: buildSystemPrompt(targetLang) },
+        { role: 'system', content: buildSystemPrompt(targetLang, context) },
         { role: 'user', content: text },
       ],
     }),
@@ -187,13 +195,13 @@ async function translateDeepL({ text, targetLang, config, signal, onChunk }) {
   return { translation: translated.trim(), provider: 'deepl', model: 'deepl' };
 }
 
-export async function translateStream({ text, targetLang, config, signal, onChunk }) {
+export async function translateStream({ text, targetLang, context = '', config, signal, onChunk }) {
   const provider = config.provider || 'gemini';
   if (provider === 'gemini') {
-    return translateGemini({ text, targetLang, config, signal, onChunk });
+    return translateGemini({ text, targetLang, context, config, signal, onChunk });
   }
   if (provider === 'openai') {
-    return translateOpenAI({ text, targetLang, config, signal, onChunk });
+    return translateOpenAI({ text, targetLang, context, config, signal, onChunk });
   }
   if (provider === 'deepl') {
     return translateDeepL({ text, targetLang, config, signal, onChunk });
